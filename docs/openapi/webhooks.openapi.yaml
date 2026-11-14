@@ -1,0 +1,915 @@
+openapi: 3.1.0
+
+info:
+  title: OMS - Webhooks de notificação de pedidos
+  version: 0.2.0
+  summary: Cadastro de webhooks, histórico de entregas, replay da DLQ e o evento enviado ao endpoint do cliente.
+  description: |
+    Contratos da feature de webhooks do Order Management System, detalhados no FDD (`docs/FDD.md`, seção 7). Esta spec é a referência de formato, validação e exemplos; fluxos, transações e comportamento do worker estão no FDD. A API ainda não existe no código: a spec descreve o que será implementado e acompanha o status do FDD, "Em revisão".
+
+    **Convenções.** Valores fixados na reunião técnica trazem a localização `[hh:mm] Nome`, que remete a `TRANSCRICAO.md`. O que a reunião não fixou e o FDD propôs está marcado como **(AUTOR)**, com o número da proposta na seção 18.2 do FDD (P-01 a P-20).
+
+    **Regras comuns.** Todos os caminhos ficam sob `/api/v1` e exigem `Authorization: Bearer <jwt>`, obtido em `POST /api/v1/auth/login`. Qualquer role autenticada (`ADMIN` ou `OPERATOR`) usa o cadastro ([09:37] Sofia); o replay da DLQ exige `ADMIN` ([09:36] Sofia, [09:36] Larissa). Erros seguem o formato `{ "error": { "code", "message", "details"? } }` do error middleware existente. O JSON da API usa camelCase, como o resto do OMS; o evento enviado ao cliente usa snake_case ([09:43] Diego). A secret só aparece nas respostas de criação e de rotação.
+
+    **Evento de saída.** A chamada que o OMS faz ao endpoint do cliente está descrita na seção `webhooks` desta spec (`orderStatusChanged`), com cabeçalhos, corpo, semântica de entrega e um exemplo de verificação da assinatura.
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Ambiente local (`npm run dev`, porta padrão de `src/config/env.ts`)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Webhooks
+    description: Cadastro, rotação de secret e histórico de entregas dos webhooks de um cliente.
+  - name: DLQ
+    description: Operações administrativas sobre a dead letter queue, restritas à role `ADMIN`.
+
+paths:
+  /webhooks:
+    post:
+      tags: [Webhooks]
+      operationId: createWebhook
+      summary: Cadastrar webhook
+      description: |
+        Cadastra um webhook para um cliente e devolve a secret gerada pela plataforma ([09:31] Marcos). O `customerId` vem no body, não do JWT, porque o JWT identifica o operador ([09:32] Larissa). Não é idempotente: cada chamada cria um webhook e uma secret.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+            examples:
+              cadastro:
+                $ref: '#/components/examples/CreateWebhookRequest'
+      responses:
+        '201':
+          description: Webhook criado. A secret vem somente nesta resposta e na de rotação.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookWithSecret'
+              examples:
+                criado:
+                  $ref: '#/components/examples/WebhookCreated'
+        '400':
+          description: Body inválido (`VALIDATION_ERROR`). URL sem `https` traz `details[].message = "WEBHOOK_INVALID_URL"` **(AUTOR, P-21)**.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                urlSemHttps:
+                  $ref: '#/components/examples/InvalidUrlError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/CustomerNotFound'
+    get:
+      tags: [Webhooks]
+      operationId: listWebhooks
+      summary: Listar webhooks de um cliente
+      description: |
+        Lista os webhooks de um cliente ([09:33] Bruno), no formato paginado `{ data, pagination }` de `src/shared/http/response.ts`. O `customerId` vai na query, seguindo o filtro `customerId` de `listOrdersQuerySchema` **(AUTOR, P-10)**. A secret nunca aparece na listagem.
+      parameters:
+        - $ref: '#/components/parameters/CustomerIdQuery'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Lista, possivelmente vazia.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookPage'
+              examples:
+                umWebhook:
+                  $ref: '#/components/examples/WebhookPage'
+        '400':
+          description: '`customerId` ausente ou inválido, ou paginação fora dos limites (`VALIDATION_ERROR`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                customerIdAusente:
+                  $ref: '#/components/examples/MissingCustomerIdError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/CustomerNotFound'
+
+  /webhooks/{id}:
+    parameters:
+      - $ref: '#/components/parameters/WebhookId'
+    patch:
+      tags: [Webhooks]
+      operationId: updateWebhook
+      summary: Editar webhook
+      description: |
+        Edita URL, status assinados ou estado ativo ([09:33] Bruno). É idempotente: o mesmo body produz o mesmo estado. `customerId` e a secret não são editáveis e, se vierem no body, são descartados sem erro, porque os schemas Zod do projeto removem campos desconhecidos. A mudança de `events` não afeta eventos já na outbox; a de `url` vale a partir do próximo envio; `active = false` faz os pendentes irem para a DLQ com `WEBHOOK_INACTIVE` (FDD, seção 6.7).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWebhookRequest'
+            examples:
+              edicao:
+                $ref: '#/components/examples/UpdateWebhookRequest'
+      responses:
+        '200':
+          description: Webhook atualizado, sem a secret.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+              examples:
+                atualizado:
+                  $ref: '#/components/examples/WebhookUpdated'
+        '400':
+          description: Body sem nenhum dos três campos, `:id` não UUID ou regras do cadastro violadas (`VALIDATION_ERROR`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                idInvalido:
+                  $ref: '#/components/examples/InvalidIdError'
+                urlSemHttps:
+                  $ref: '#/components/examples/InvalidUrlError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/WebhookNotFound'
+    delete:
+      tags: [Webhooks]
+      operationId: deleteWebhook
+      summary: Remover webhook
+      description: |
+        Remove o webhook ([09:33] Bruno). As linhas de outbox, DLQ e histórico do webhook são removidas em cascata **(AUTOR, P-13)**.
+      responses:
+        '204':
+          description: Webhook removido.
+        '400':
+          $ref: '#/components/responses/InvalidId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/WebhookNotFound'
+
+  /webhooks/{id}/rotate-secret:
+    parameters:
+      - $ref: '#/components/parameters/WebhookId'
+    post:
+      tags: [Webhooks]
+      operationId: rotateWebhookSecret
+      summary: Rotacionar secret
+      description: |
+        Gera uma secret nova; a anterior continua válida por 24 h ([09:21] Sofia). Durante esse período, cada envio leva duas assinaturas em `X-Signature`, uma com cada secret **(AUTOR, P-02)**. Uma nova rotação dentro das 24 h descarta a secret anterior na hora **(AUTOR, P-17)**. O caminho é **(AUTOR, P-10)**. Não é idempotente: cada chamada gera uma secret nova.
+      responses:
+        '200':
+          description: Secret rotacionada. A secret nova vem somente nesta resposta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateSecretResponse'
+              examples:
+                rotacionada:
+                  $ref: '#/components/examples/SecretRotated'
+        '400':
+          $ref: '#/components/responses/InvalidId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/WebhookNotFound'
+
+  /webhooks/{id}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/WebhookId'
+    get:
+      tags: [Webhooks]
+      operationId: listWebhookDeliveries
+      summary: Histórico de entregas
+      description: |
+        Histórico das entregas do webhook, com sucesso ou falha, payload, resposta e tempo de resposta ([09:34] Marcos). A ordem é `createdAt` decrescente, e `pageSize` tem padrão 100 e máximo 100, para atender "os últimos 100" **(AUTOR, P-19)**.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/DeliveriesPageSize'
+      responses:
+        '200':
+          description: Lista, possivelmente vazia, das mais recentes para as mais antigas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryPage'
+              examples:
+                umaFalha:
+                  $ref: '#/components/examples/DeliveryPage'
+        '400':
+          description: '`:id` não é UUID ou `pageSize` fora de 1 a 100 (`VALIDATION_ERROR`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                idInvalido:
+                  $ref: '#/components/examples/InvalidIdError'
+                pageSizeInvalido:
+                  $ref: '#/components/examples/InvalidPageSizeError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/WebhookNotFound'
+
+  /admin/webhooks/dead-letter/{id}/replay:
+    parameters:
+      - $ref: '#/components/parameters/DeadLetterId'
+    post:
+      tags: [DLQ]
+      operationId: replayDeadLetter
+      summary: Reprocessar evento da DLQ
+      description: |
+        Recoloca um evento da DLQ na outbox como `PENDING`, com o mesmo `X-Event-Id` e o mesmo corpo ([09:18] Diego, [09:35] Diego). Restrito a `ADMIN` via `requireRole('ADMIN')` ([09:36] Sofia, [09:36] Larissa), com log de auditoria `webhook_dead_letter_replayed`. O evento recebe um ciclo completo de 6 envios **(AUTOR, P-17)**. O status 202 indica que o evento foi enfileirado, não entregue **(AUTOR, P-10)**. Dois replays simultâneos da mesma entrada resultam em um 202 e um 409 `WEBHOOK_DEAD_LETTER_ALREADY_REPLAYED`, porque a entrada é reservada por um update condicional antes de o evento voltar à outbox **(AUTOR, P-20)**. O `id` vem do log `webhook_dead_lettered` ou de consulta ao banco: não há listagem da DLQ pela API.
+      responses:
+        '202':
+          description: Evento recolocado na outbox.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayResponse'
+              examples:
+                recolocado:
+                  $ref: '#/components/examples/ReplayAccepted'
+        '400':
+          $ref: '#/components/responses/InvalidId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Entrada inexistente na DLQ.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                naoEncontrada:
+                  $ref: '#/components/examples/DeadLetterNotFoundError'
+        '409':
+          description: Entrada já reprocessada, inclusive por um replay simultâneo da mesma entrada que confirmou antes **(AUTOR, P-20)**, ou webhook inativo **(AUTOR, P-14)**.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                jaReprocessada:
+                  $ref: '#/components/examples/AlreadyReplayedError'
+                webhookInativo:
+                  $ref: '#/components/examples/WebhookInactiveError'
+
+webhooks:
+  orderStatusChanged:
+    post:
+      operationId: orderStatusChanged
+      summary: Mudança de status de pedido
+      security: []
+      description: |
+        Requisição que o worker do OMS envia ao `url` de cada webhook ativo do cliente que assina o novo status, depois que a mudança de status é gravada ([09:40] Bruno). Uma mudança gera um evento por webhook interessado, cada um com seu `event_id` **(AUTOR, P-05)**.
+
+        **Garantia de entrega: at-least-once.** O mesmo evento pode chegar mais de uma vez, sempre com o mesmo `X-Event-Id` e o mesmo corpo, byte a byte. Deduplique pelo `X-Event-Id`, que é igual ao `event_id` do corpo ([09:25] Diego).
+
+        **Confirmação.** Qualquer status 2xx em até 10 s confirma a entrega ([09:42] Diego). O corpo da resposta é ignorado, mas os primeiros 2.048 caracteres ficam no histórico de entregas **(AUTOR, P-11)**.
+
+        **Falha e retentativa.** Qualquer outro status, inclusive 3xx e 4xx, o timeout de 10 s e erros de rede ou TLS contam como falha **(AUTOR, P-09)**. Redirects não são seguidos **(AUTOR, P-16)**. Os reenvios acontecem 1 min, 5 min, 30 min, 2 h e 12 h depois da falha anterior ([09:17] Diego): são 6 envios no total, ao longo de até 14 h 36 min **(AUTOR, P-01)**. Se o sexto envio falhar, o evento vai para a DLQ e só volta por replay manual de um administrador.
+
+        **Ordem.** Os eventos de um mesmo pedido chegam a um webhook na ordem em que aconteceram ([09:12] Diego), com a exceção do replay, que pode chegar depois de eventos posteriores já entregues.
+
+        **Verificação da assinatura.** `X-Signature` é `sha256=` seguido do HMAC-SHA256 em hexadecimal do corpo bruto, com a secret do webhook como chave ([09:20] Sofia, [09:22] Sofia). Nas 24 h seguintes a uma rotação, o cabeçalho traz duas assinaturas separadas por vírgula, a da secret nova e a da anterior **(AUTOR, P-02)**: aceite a requisição se qualquer uma conferir. Verifique sobre os bytes recebidos, antes de qualquer parse do JSON. Exemplo sugerido para o portal de desenvolvedores **(AUTOR, P-26)**:
+
+        ```ts
+        import { createHmac, timingSafeEqual } from 'node:crypto';
+
+        function isValidSignature(rawBody: Buffer, header: string, secret: string): boolean {
+          const expected = Buffer.from(`sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`);
+          return header.split(',').some((candidate) => {
+            const received = Buffer.from(candidate.trim());
+            return received.length === expected.length && timingSafeEqual(received, expected);
+          });
+        }
+        ```
+
+        **Proteção contra replay.** Não use o `timestamp` do corpo nem o `X-Timestamp` como janela de validade: o corpo se repete nas retentativas e no replay, e o `X-Timestamp` não é assinado. A proteção é a deduplicação pelo `event_id`, que é assinado (FDD, seção 10.3) **(AUTOR, P-22)**.
+
+        **Vetor de teste.** O exemplo de corpo abaixo, serializado sem espaços e na ordem mostrada (326 bytes), com a secret `whsec_6f1c0b9e2a7d4e8f9c3b6a1d5e2f7c8b9a0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f`, gera a assinatura do exemplo `X-Signature`. Com a secret `whsec_0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b`, gera `sha256=42243535579bb4468ed5ceb509776c403c74cf7d006cbe88e85a878195993936`.
+      parameters:
+        - $ref: '#/components/parameters/XEventId'
+        - $ref: '#/components/parameters/XWebhookId'
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+      requestBody:
+        required: true
+        description: Snapshot do pedido no momento da mudança, gravado na outbox e enviado sem alteração em todos os envios (ADR-008). Limite de 65.536 bytes ([09:24] Larissa); acima disso o evento vai para a DLQ sem envio.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderStatusChangedEvent'
+            examples:
+              enviado:
+                $ref: '#/components/examples/OrderStatusChangedEvent'
+      responses:
+        '2XX':
+          description: Entrega confirmada. Nenhuma retentativa é feita.
+        default:
+          description: Qualquer outro status, um redirect, o timeout de 10 s ou um erro de rede contam como falha e geram retentativa, até o sexto envio.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT emitido por `POST /api/v1/auth/login` e validado pelo middleware `authenticate` (`src/middlewares/auth.middleware.ts`). Identifica o usuário operador, não o cliente ([09:32] Bruno).
+
+  parameters:
+    WebhookId:
+      name: id
+      in: path
+      required: true
+      description: Id do webhook.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+      example: 3b0e6a52-6f0c-4a51-9a3e-0f2b5d7c9e11
+    DeadLetterId:
+      name: id
+      in: path
+      required: true
+      description: Id da entrada na DLQ (`deadLetterId` do log `webhook_dead_lettered`).
+      schema:
+        $ref: '#/components/schemas/Uuid'
+      example: 5c6d7e8f-9a0b-4c1d-8e2f-3a4b5c6d7e8f
+    CustomerIdQuery:
+      name: customerId
+      in: query
+      required: true
+      description: Id do cliente dono dos webhooks.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+      example: a7c4e2d1-0b9f-4c3e-8d21-5f6a7b8c9d01
+    Page:
+      name: page
+      in: query
+      required: false
+      description: Página, a partir de 1.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      description: Itens por página, como em `listOrdersQuerySchema`.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    DeliveriesPageSize:
+      name: pageSize
+      in: query
+      required: false
+      description: Itens por página. O padrão é 100 para atender "os últimos 100" ([09:34] Marcos) **(AUTOR, P-19)**.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 100
+    XEventId:
+      name: X-Event-Id
+      in: header
+      required: true
+      description: Id do evento, igual ao `event_id` do corpo e estável em retentativas e replay ([09:25] Diego). Chave de deduplicação.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+      example: 8f14e45f-ceea-4e7a-9f6b-2d1c3b7a9e01
+    XWebhookId:
+      name: X-Webhook-Id
+      in: header
+      required: true
+      description: Id do webhook que originou o envio ([09:44] Sofia).
+      schema:
+        $ref: '#/components/schemas/Uuid'
+      example: 3b0e6a52-6f0c-4a51-9a3e-0f2b5d7c9e11
+    XTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      description: Instante do envio, em ISO 8601 UTC ([09:44] Diego); o formato é **(AUTOR, P-07)**. Muda a cada envio e não entra na assinatura, por isso não serve como janela antirreplay **(AUTOR, P-22)**.
+      schema:
+        type: string
+        format: date-time
+      example: '2026-11-12T14:03:28.904Z'
+    XSignature:
+      name: X-Signature
+      in: header
+      required: true
+      description: '`sha256=<hex>` com o HMAC-SHA256 do corpo bruto ([09:20] Sofia). Nas 24 h seguintes a uma rotação, `sha256=<hex com a secret nova>,sha256=<hex com a anterior>`. O formato é **(AUTOR, P-07)**.'
+      schema:
+        type: string
+        pattern: '^sha256=[0-9a-f]{64}(,sha256=[0-9a-f]{64})?$'
+      examples:
+        umaSecret:
+          summary: Fora do período de rotação
+          value: sha256=8025653509bf50768d21d9fdaaf58b5fe8ff350d02bdb00fe4e155942141ec25
+        rotacao:
+          summary: Nas 24 h seguintes a uma rotação (nova, anterior)
+          value: sha256=42243535579bb4468ed5ceb509776c403c74cf7d006cbe88e85a878195993936,sha256=8025653509bf50768d21d9fdaaf58b5fe8ff350d02bdb00fe4e155942141ec25
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+      description: UUID, padrão de ids do projeto ([09:51] Larissa).
+    OrderStatus:
+      type: string
+      description: Status do pedido, enum `OrderStatus` de `prisma/schema.prisma`.
+      enum: [PENDING, PAID, PROCESSING, SHIPPED, DELIVERED, CANCELLED]
+    SubscribableStatus:
+      type: string
+      description: Status que um webhook pode assinar ([09:33] Marcos). `PENDING` fica de fora porque nenhuma transição de `src/modules/orders/order.status.ts` leva a ele **(AUTOR, P-15)**.
+      enum: [PAID, PROCESSING, SHIPPED, DELIVERED, CANCELLED]
+    WebhookUrl:
+      type: string
+      format: uri
+      maxLength: 2048
+      pattern: '^[hH][tT][tT][pP][sS]://'
+      description: URL do endpoint do cliente. Só `https` ([09:23] Sofia); a checagem ignora maiúsculas e, quando falha, gera `details[].message = "WEBHOOK_INVALID_URL"` **(AUTOR, P-21)**. Até 2.048 caracteres **(AUTOR, P-11)**.
+    WebhookEvents:
+      type: array
+      minItems: 1
+      uniqueItems: true
+      description: Status assinados, sem repetição. O filtro é aplicado quando o evento é criado ([09:34] Bruno).
+      items:
+        $ref: '#/components/schemas/SubscribableStatus'
+    WebhookSecret:
+      type: string
+      pattern: '^whsec_[0-9a-f]{64}$'
+      description: Secret gerada pela plataforma ([09:31] Marcos), uma por webhook ([09:21] Sofia), com o formato `whsec_` seguido de 64 caracteres hexadecimais **(AUTOR, P-07)**.
+    Timestamp:
+      type: string
+      format: date-time
+    CreateWebhookRequest:
+      type: object
+      required: [customerId, url, events]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        url:
+          $ref: '#/components/schemas/WebhookUrl'
+        events:
+          $ref: '#/components/schemas/WebhookEvents'
+    UpdateWebhookRequest:
+      type: object
+      description: Pelo menos um dos três campos. Campos desconhecidos, como `customerId` e `secret`, são descartados sem erro.
+      properties:
+        url:
+          $ref: '#/components/schemas/WebhookUrl'
+        events:
+          $ref: '#/components/schemas/WebhookEvents'
+        active:
+          type: boolean
+          description: '`false` suspende novos eventos e leva os pendentes à DLQ com `WEBHOOK_INACTIVE` **(AUTOR, P-14)**.'
+      anyOf:
+        - required: [url]
+        - required: [events]
+        - required: [active]
+    Webhook:
+      type: object
+      description: Representação do webhook nas respostas, sem a secret.
+      required: [id, customerId, url, events, active, previousSecretExpiresAt, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        url:
+          $ref: '#/components/schemas/WebhookUrl'
+        events:
+          $ref: '#/components/schemas/WebhookEvents'
+        active:
+          type: boolean
+        previousSecretExpiresAt:
+          type: [string, 'null']
+          format: date-time
+          description: Fim da convivência da secret anterior; `null` fora do período de rotação.
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    WebhookWithSecret:
+      description: Webhook recém-criado, com a secret. Só aparece no `201` do cadastro.
+      allOf:
+        - $ref: '#/components/schemas/Webhook'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              $ref: '#/components/schemas/WebhookSecret'
+    RotateSecretResponse:
+      type: object
+      required: [id, secret, previousSecretExpiresAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        secret:
+          $ref: '#/components/schemas/WebhookSecret'
+        previousSecretExpiresAt:
+          type: string
+          format: date-time
+          description: Momento da rotação mais 24 h ([09:21] Sofia).
+    Delivery:
+      type: object
+      description: Um envio ao endpoint do cliente, com sucesso ou falha ([09:34] Marcos).
+      required: [id, eventId, attempt, success, statusCode, errorCode, durationMs, payload, responseBody, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        eventId:
+          $ref: '#/components/schemas/Uuid'
+        attempt:
+          type: integer
+          minimum: 1
+          maximum: 6
+          description: Número do envio, de 1 (inicial) a 6.
+        success:
+          type: boolean
+        statusCode:
+          type: [integer, 'null']
+          minimum: 100
+          maximum: 599
+          description: Status HTTP recebido; `null` em timeout ou erro de rede.
+        errorCode:
+          type: [string, 'null']
+          enum: [WEBHOOK_DELIVERY_TIMEOUT, WEBHOOK_DELIVERY_HTTP_ERROR, WEBHOOK_DELIVERY_NETWORK_ERROR, null]
+          description: Classificação da falha (FDD, seção 8.2); `null` no sucesso.
+        durationMs:
+          type: integer
+          minimum: 0
+          description: Do início da chamada ao fim da leitura da resposta.
+        payload:
+          $ref: '#/components/schemas/OrderStatusChangedEvent'
+        responseBody:
+          type: [string, 'null']
+          maxLength: 2048
+          description: Início do corpo da resposta, até 2.048 caracteres **(AUTOR, P-11)**; `null` quando não houve resposta.
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+    Pagination:
+      type: object
+      description: Formato de `paginated()` em `src/shared/http/response.ts`.
+      required: [page, pageSize, total, totalPages]
+      properties:
+        page:
+          type: integer
+          minimum: 1
+        pageSize:
+          type: integer
+          minimum: 1
+        total:
+          type: integer
+          minimum: 0
+        totalPages:
+          type: integer
+          minimum: 0
+    WebhookPage:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Webhook'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    DeliveryPage:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Delivery'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    ReplayResponse:
+      type: object
+      required: [deadLetterId, eventId, webhookId, status, replayedAt, replayedById]
+      properties:
+        deadLetterId:
+          $ref: '#/components/schemas/Uuid'
+        eventId:
+          $ref: '#/components/schemas/Uuid'
+        webhookId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          const: PENDING
+        replayedAt:
+          $ref: '#/components/schemas/Timestamp'
+        replayedById:
+          description: Id do usuário `ADMIN` que pediu o replay, para auditoria ([09:36] Sofia).
+          $ref: '#/components/schemas/Uuid'
+    ValidationIssue:
+      type: object
+      required: [path, message]
+      properties:
+        path:
+          type: string
+          description: Caminho do campo, com os segmentos unidos por ponto, ou `(root)`.
+        message:
+          type: string
+    ErrorResponse:
+      type: object
+      description: Formato de `src/middlewares/error.middleware.ts`, sem alteração ([09:29] Bruno).
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Código do erro. Os da feature usam o prefixo `WEBHOOK_` (FDD, seção 8.1).
+            message:
+              type: string
+            details:
+              type: array
+              description: Presente em `VALIDATION_ERROR`, com um item por campo inválido.
+              items:
+                $ref: '#/components/schemas/ValidationIssue'
+    OrderStatusChangedEvent:
+      type: object
+      description: Corpo do evento, em snake_case ([09:43] Diego). Não leva os itens do pedido; quem precisar deles consulta `GET /api/v1/orders/{id}`.
+      required: [event_id, event_type, timestamp, order_id, order_number, from_status, to_status, customer_id, total_cents]
+      properties:
+        event_id:
+          description: Id da linha da outbox, igual ao `X-Event-Id` ([09:25] Diego).
+          $ref: '#/components/schemas/Uuid'
+        event_type:
+          type: string
+          const: order.status_changed
+        timestamp:
+          type: string
+          format: date-time
+          description: Momento da mudança de status, gerado na transação; não muda entre envios **(AUTOR, P-18)**.
+        order_id:
+          $ref: '#/components/schemas/Uuid'
+        order_number:
+          type: string
+          pattern: '^ORD-[0-9]{6,}$'
+          description: Número do pedido, gerado por `OrderNumberSequence` no formato `ORD-000123`.
+        from_status:
+          $ref: '#/components/schemas/OrderStatus'
+        to_status:
+          $ref: '#/components/schemas/SubscribableStatus'
+        customer_id:
+          $ref: '#/components/schemas/Uuid'
+        total_cents:
+          type: integer
+          minimum: 0
+          description: Total do pedido em centavos, único "campo básico" do pedido no corpo **(AUTOR, P-08)**.
+
+  responses:
+    Unauthorized:
+      description: Token ausente, inválido ou expirado (`UNAUTHORIZED`, de `authenticate`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            semToken:
+              $ref: '#/components/examples/UnauthorizedError'
+    Forbidden:
+      description: Usuário sem a role `ADMIN` (`FORBIDDEN`, de `requireRole`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            semAdmin:
+              $ref: '#/components/examples/ForbiddenError'
+    InvalidId:
+      description: '`:id` não é UUID (`VALIDATION_ERROR`).'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            idInvalido:
+              $ref: '#/components/examples/InvalidIdError'
+    WebhookNotFound:
+      description: Webhook inexistente (`WEBHOOK_NOT_FOUND`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            naoEncontrado:
+              $ref: '#/components/examples/WebhookNotFoundError'
+    CustomerNotFound:
+      description: '`customerId` inexistente (`WEBHOOK_CUSTOMER_NOT_FOUND`).'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            clienteInexistente:
+              $ref: '#/components/examples/CustomerNotFoundError'
+
+  examples:
+    CreateWebhookRequest:
+      summary: Webhook para pedidos enviados e entregues
+      value:
+        customerId: a7c4e2d1-0b9f-4c3e-8d21-5f6a7b8c9d01
+        url: https://hooks.cliente.example/pedidos
+        events: [SHIPPED, DELIVERED]
+    WebhookCreated:
+      summary: Webhook criado, com a secret
+      value:
+        id: 3b0e6a52-6f0c-4a51-9a3e-0f2b5d7c9e11
+        customerId: a7c4e2d1-0b9f-4c3e-8d21-5f6a7b8c9d01
+        url: https://hooks.cliente.example/pedidos
+        events: [SHIPPED, DELIVERED]
+        active: true
+        previousSecretExpiresAt: null
+        secret: whsec_6f1c0b9e2a7d4e8f9c3b6a1d5e2f7c8b9a0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f
+        createdAt: '2026-11-12T13:00:00.000Z'
+        updatedAt: '2026-11-12T13:00:00.000Z'
+    WebhookPage:
+      summary: Primeira página com um webhook
+      value:
+        data:
+          - id: 3b0e6a52-6f0c-4a51-9a3e-0f2b5d7c9e11
+            customerId: a7c4e2d1-0b9f-4c3e-8d21-5f6a7b8c9d01
+            url: https://hooks.cliente.example/pedidos
+            events: [SHIPPED, DELIVERED]
+            active: true
+            previousSecretExpiresAt: null
+            createdAt: '2026-11-12T13:00:00.000Z'
+            updatedAt: '2026-11-12T13:00:00.000Z'
+        pagination:
+          page: 1
+          pageSize: 20
+          total: 1
+          totalPages: 1
+    UpdateWebhookRequest:
+      summary: Passa a assinar também PAID
+      value:
+        events: [PAID, SHIPPED, DELIVERED]
+        active: true
+    WebhookUpdated:
+      summary: Webhook atualizado, sem a secret
+      value:
+        id: 3b0e6a52-6f0c-4a51-9a3e-0f2b5d7c9e11
+        customerId: a7c4e2d1-0b9f-4c3e-8d21-5f6a7b8c9d01
+        url: https://hooks.cliente.example/pedidos
+        events: [PAID, SHIPPED, DELIVERED]
+        active: true
+        previousSecretExpiresAt: null
+        createdAt: '2026-11-12T13:00:00.000Z'
+        updatedAt: '2026-11-12T15:20:00.000Z'
+    SecretRotated:
+      summary: Secret nova; a anterior vale até previousSecretExpiresAt
+      value:
+        id: 3b0e6a52-6f0c-4a51-9a3e-0f2b5d7c9e11
+        secret: whsec_0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b
+        previousSecretExpiresAt: '2026-11-13T15:30:00.000Z'
+    DeliveryPage:
+      summary: Uma entrega com falha 503
+      value:
+        data:
+          - id: e2d9c1b0-7a6f-4e5d-9c8b-1a2b3c4d5e6f
+            eventId: 8f14e45f-ceea-4e7a-9f6b-2d1c3b7a9e01
+            attempt: 2
+            success: false
+            statusCode: 503
+            errorCode: WEBHOOK_DELIVERY_HTTP_ERROR
+            durationMs: 184
+            payload:
+              event_id: 8f14e45f-ceea-4e7a-9f6b-2d1c3b7a9e01
+              event_type: order.status_changed
+              timestamp: '2026-11-12T14:03:27.512Z'
+              order_id: d4c3b2a1-9e8f-4a7b-8c6d-5e4f3a2b1c0d
+              order_number: ORD-000123
+              from_status: PROCESSING
+              to_status: SHIPPED
+              customer_id: a7c4e2d1-0b9f-4c3e-8d21-5f6a7b8c9d01
+              total_cents: 18500
+            responseBody: Service Unavailable
+            createdAt: '2026-11-12T14:04:30.120Z'
+        pagination:
+          page: 1
+          pageSize: 100
+          total: 1
+          totalPages: 1
+    ReplayAccepted:
+      summary: Evento recolocado como PENDING
+      value:
+        deadLetterId: 5c6d7e8f-9a0b-4c1d-8e2f-3a4b5c6d7e8f
+        eventId: 8f14e45f-ceea-4e7a-9f6b-2d1c3b7a9e01
+        webhookId: 3b0e6a52-6f0c-4a51-9a3e-0f2b5d7c9e11
+        status: PENDING
+        replayedAt: '2026-11-13T09:10:00.000Z'
+        replayedById: 0d1e2f3a-4b5c-4d6e-8f70-81920a1b2c3d
+    OrderStatusChangedEvent:
+      summary: Pedido ORD-000123 passou de PROCESSING para SHIPPED
+      value:
+        event_id: 8f14e45f-ceea-4e7a-9f6b-2d1c3b7a9e01
+        event_type: order.status_changed
+        timestamp: '2026-11-12T14:03:27.512Z'
+        order_id: d4c3b2a1-9e8f-4a7b-8c6d-5e4f3a2b1c0d
+        order_number: ORD-000123
+        from_status: PROCESSING
+        to_status: SHIPPED
+        customer_id: a7c4e2d1-0b9f-4c3e-8d21-5f6a7b8c9d01
+        total_cents: 18500
+    InvalidUrlError:
+      summary: URL sem https
+      value:
+        error:
+          code: VALIDATION_ERROR
+          message: Validation failed
+          details:
+            - path: url
+              message: WEBHOOK_INVALID_URL
+    MissingCustomerIdError:
+      summary: customerId ausente na query
+      value:
+        error:
+          code: VALIDATION_ERROR
+          message: Validation failed
+          details:
+            - path: customerId
+              message: Required
+    InvalidIdError:
+      summary: id que não é UUID
+      value:
+        error:
+          code: VALIDATION_ERROR
+          message: Validation failed
+          details:
+            - path: id
+              message: Invalid uuid
+    InvalidPageSizeError:
+      summary: pageSize acima de 100
+      value:
+        error:
+          code: VALIDATION_ERROR
+          message: Validation failed
+          details:
+            - path: pageSize
+              message: Number must be less than or equal to 100
+    UnauthorizedError:
+      summary: Sem cabeçalho Authorization
+      value:
+        error:
+          code: UNAUTHORIZED
+          message: Missing or invalid Authorization header
+    ForbiddenError:
+      summary: OPERATOR tentando o replay
+      value:
+        error:
+          code: FORBIDDEN
+          message: Insufficient permissions
+    WebhookNotFoundError:
+      summary: Webhook inexistente
+      value:
+        error:
+          code: WEBHOOK_NOT_FOUND
+          message: Webhook not found
+    CustomerNotFoundError:
+      summary: Cliente inexistente
+      value:
+        error:
+          code: WEBHOOK_CUSTOMER_NOT_FOUND
+          message: Customer not found
+    DeadLetterNotFoundError:
+      summary: Entrada da DLQ inexistente
+      value:
+        error:
+          code: WEBHOOK_DEAD_LETTER_NOT_FOUND
+          message: Dead letter entry not found
+    AlreadyReplayedError:
+      summary: Entrada já reprocessada
+      value:
+        error:
+          code: WEBHOOK_DEAD_LETTER_ALREADY_REPLAYED
+          message: Dead letter entry already replayed
+    WebhookInactiveError:
+      summary: Webhook inativo
+      value:
+        error:
+          code: WEBHOOK_INACTIVE
+          message: Webhook is inactive
